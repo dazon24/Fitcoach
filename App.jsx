@@ -1,0 +1,1385 @@
+import React, { useState, useRef } from "react";
+import { Camera, Dumbbell, Activity, Sparkles, Plus, Trash2, ChevronRight, Flame, Moon, Heart, Footprints, Scale, Mic, Keyboard, Square, Image as ImageIcon } from "lucide-react";
+
+// ---------- helpers ----------
+const fileToBase64 = (file) =>
+  new Promise((resolve, reject) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result.split(",")[1]);
+    r.onerror = reject;
+    r.readAsDataURL(file);
+  });
+
+async function callClaude(messages, { vision } = {}) {
+  const res = await fetch("/api/claude", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: "claude-sonnet-4-6",
+      max_tokens: 1000,
+      messages,
+    }),
+  });
+  const data = await res.json();
+  const text = (data.content || [])
+    .map((b) => (b.type === "text" ? b.text : ""))
+    .join("\n");
+  return text;
+}
+
+function parseJsonLoose(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  try {
+    return JSON.parse(clean);
+  } catch {
+    const match = clean.match(/\{[\s\S]*\}/);
+    if (match) {
+      try {
+        return JSON.parse(match[0]);
+      } catch {}
+    }
+    return null;
+  }
+}
+
+// ---------- design tokens ----------
+// Palette: ink #15201C, paper #F6F3EC, moss #3F5C49, ember #C76B3E, signal #E8E1D2, line #D8D2C2
+// Type: display "Fraunces" (characterful serif), body "Inter", mono "JetBrains Mono"-ish via system mono for numbers
+
+const FONT_LINK = "https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@500&display=swap";
+
+function useInjectFonts() {
+  React.useEffect(() => {
+    if (document.getElementById("fc-fonts")) return;
+    const link = document.createElement("link");
+    link.id = "fc-fonts";
+    link.rel = "stylesheet";
+    link.href = FONT_LINK;
+    document.head.appendChild(link);
+  }, []);
+}
+
+const styles = {
+  display: { fontFamily: "'Fraunces', serif" },
+  body: { fontFamily: "'Inter', sans-serif" },
+  mono: { fontFamily: "'JetBrains Mono', monospace" },
+};
+
+// ---------- speech recognition hook ----------
+function useSpeechToText() {
+  const [listening, setListening] = useState(false);
+  const [transcript, setTranscript] = useState("");
+  const [unsupported, setUnsupported] = useState(false);
+  const recRef = useRef(null);
+
+  function start() {
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SR) {
+      setUnsupported(true);
+      return;
+    }
+    const rec = new SR();
+    rec.lang = "fr-FR";
+    rec.interimResults = true;
+    rec.continuous = true;
+    rec.onresult = (e) => {
+      let text = "";
+      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
+      setTranscript(text);
+    };
+    rec.onend = () => setListening(false);
+    rec.onerror = () => setListening(false);
+    recRef.current = rec;
+    setTranscript("");
+    setListening(true);
+    rec.start();
+  }
+
+  function stop() {
+    recRef.current?.stop();
+    setListening(false);
+  }
+
+  return { listening, transcript, start, stop, unsupported, setTranscript };
+}
+
+// ---------- input mode selector ----------
+function ModeSelector({ mode, setMode, modes }) {
+  return (
+    <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+      {modes.map((m) => {
+        const active = mode === m.id;
+        return (
+          <button
+            key={m.id}
+            onClick={() => setMode(m.id)}
+            style={{
+              flex: 1,
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 6,
+              padding: "9px 0",
+              borderRadius: 9,
+              border: "1px solid",
+              borderColor: active ? "transparent" : "#3A453E",
+              background: active ? "#E8E1D2" : "transparent",
+              color: active ? "#15201C" : "#A8A493",
+              fontSize: 12.5,
+              fontWeight: 500,
+              cursor: "pointer",
+            }}
+          >
+            <m.icon size={14} />
+            {m.label}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
+// ---------- main app ----------
+export default function App() {
+  useInjectFonts();
+  const [tab, setTab] = useState("nutrition");
+  const [profile, setProfile] = useState(null);
+  const [showProfileEdit, setShowProfileEdit] = useState(false);
+
+  const [meals, setMeals] = useState([]);
+  const [workouts, setWorkouts] = useState([]);
+  const [bio, setBio] = useState({
+    restingHR: 58,
+    sleepHours: 7.2,
+    steps: 8400,
+    weight: 68.4,
+    hrv: 52,
+  });
+
+  const tabs = [
+    { id: "nutrition", label: "Nutrition", icon: Camera },
+    { id: "training", label: "Entraînement", icon: Dumbbell },
+    { id: "biometrie", label: "Biométrie", icon: Activity },
+    { id: "coach", label: "Coach", icon: Sparkles },
+  ];
+
+  const totalIntake = meals.reduce((s, m) => s + (m.kcal || 0), 0);
+  const totalBurn = workouts.reduce((s, w) => s + (w.kcal || 0), 0);
+
+  if (!profile || showProfileEdit) {
+    return (
+      <ProfileSetup
+        existing={profile}
+        onSave={(p) => {
+          setProfile(p);
+          setBio((prev) => ({ ...prev, weight: p.poids || prev.weight }));
+          setShowProfileEdit(false);
+        }}
+      />
+    );
+  }
+
+  return (
+    <div style={{ ...styles.body, background: "#F6F3EC", minHeight: "100vh", color: "#15201C" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto", paddingBottom: 90 }}>
+        <Header profile={profile} onEditProfile={() => setShowProfileEdit(true)} />
+        <div style={{ padding: "0 20px" }}>
+          {tab === "nutrition" && <NutritionAgent meals={meals} setMeals={setMeals} />}
+          {tab === "training" && <TrainingAgent workouts={workouts} setWorkouts={setWorkouts} />}
+          {tab === "biometrie" && <BiometricsAgent bio={bio} setBio={setBio} />}
+          {tab === "coach" && (
+            <CoachAgent
+              profile={profile}
+              meals={meals}
+              workouts={workouts}
+              bio={bio}
+              totalIntake={totalIntake}
+              totalBurn={totalBurn}
+            />
+          )}
+        </div>
+      </div>
+      <TabBar tabs={tabs} active={tab} setActive={setTab} />
+    </div>
+  );
+}
+
+// ---------- profile setup (onboarding multi-testeurs) ----------
+const GOALS = ["Prise de masse", "Perte de poids", "Maintien", "Performance"];
+const SEXES = ["Femme", "Homme", "Autre"];
+
+function ProfileSetup({ existing, onSave }) {
+  useInjectFonts();
+  const [form, setForm] = useState(
+    existing || {
+      prenom: "",
+      nom: "",
+      age: "",
+      sexe: SEXES[0],
+      taille: "",
+      poids: "",
+      goal: GOALS[0],
+      targetSurplus: 400,
+    }
+  );
+
+  const canSave = form.prenom.trim() && form.age && form.poids;
+
+  const inputStyle = {
+    width: "100%",
+    background: "#FFFFFF",
+    color: "#15201C",
+    border: "1px solid #D8D2C2",
+    borderRadius: 9,
+    padding: "11px 12px",
+    fontSize: 14,
+    fontFamily: "inherit",
+    boxSizing: "border-box",
+  };
+  const labelStyle = { fontSize: 12, color: "#6B6356", marginBottom: 5, display: "block" };
+
+  function update(key, value) {
+    setForm((f) => ({ ...f, [key]: value }));
+  }
+
+  return (
+    <div style={{ ...styles.body, background: "#F6F3EC", minHeight: "100vh", color: "#15201C" }}>
+      <div style={{ maxWidth: 480, margin: "0 auto", padding: "32px 20px 60px" }}>
+        <div style={{ ...styles.mono, fontSize: 11, color: "#8A8270", letterSpacing: 0.6, textTransform: "uppercase", marginBottom: 8 }}>
+          {existing ? "Modifier le profil" : "Nouveau testeur"}
+        </div>
+        <h1 style={{ ...styles.display, fontSize: 26, fontWeight: 600, margin: "0 0 6px" }}>
+          {existing ? "Mets à jour tes infos" : "Avant de commencer"}
+        </h1>
+        <p style={{ fontSize: 13.5, color: "#6B6356", margin: "0 0 22px", lineHeight: 1.5 }}>
+          Ces informations permettent au coach de calculer des estimations adaptées à chaque personne.
+        </p>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div>
+            <label style={labelStyle}>Prénom</label>
+            <input style={inputStyle} value={form.prenom} onChange={(e) => update("prenom", e.target.value)} placeholder="Léa" />
+          </div>
+          <div>
+            <label style={labelStyle}>Nom</label>
+            <input style={inputStyle} value={form.nom} onChange={(e) => update("nom", e.target.value)} placeholder="Martin" />
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div>
+            <label style={labelStyle}>Âge</label>
+            <input style={inputStyle} type="number" value={form.age} onChange={(e) => update("age", e.target.value)} placeholder="29" />
+          </div>
+          <div>
+            <label style={labelStyle}>Sexe</label>
+            <select style={inputStyle} value={form.sexe} onChange={(e) => update("sexe", e.target.value)}>
+              {SEXES.map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginBottom: 14 }}>
+          <div>
+            <label style={labelStyle}>Taille (cm)</label>
+            <input style={inputStyle} type="number" value={form.taille} onChange={(e) => update("taille", e.target.value)} placeholder="168" />
+          </div>
+          <div>
+            <label style={labelStyle}>Poids (kg)</label>
+            <input style={inputStyle} type="number" value={form.poids} onChange={(e) => update("poids", e.target.value)} placeholder="68" />
+          </div>
+        </div>
+
+        <div style={{ marginBottom: 14 }}>
+          <label style={labelStyle}>Objectif</label>
+          <select style={inputStyle} value={form.goal} onChange={(e) => update("goal", e.target.value)}>
+            {GOALS.map((g) => (
+              <option key={g} value={g}>
+                {g}
+              </option>
+            ))}
+          </select>
+        </div>
+
+        <button
+          onClick={() => canSave && onSave({ ...form, age: parseFloat(form.age), taille: parseFloat(form.taille), poids: parseFloat(form.poids) })}
+          disabled={!canSave}
+          style={{
+            width: "100%",
+            marginTop: 8,
+            background: canSave ? "#15201C" : "#D8D2C2",
+            color: "#F6F3EC",
+            border: "none",
+            borderRadius: 10,
+            padding: "13px 0",
+            fontWeight: 600,
+            fontSize: 14.5,
+            cursor: canSave ? "pointer" : "default",
+          }}
+        >
+          {existing ? "Enregistrer" : "Commencer"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- header ----------
+function Header({ profile, onEditProfile }) {
+  const today = new Date().toLocaleDateString("fr-FR", { weekday: "long", day: "numeric", month: "long" });
+  return (
+    <div style={{ padding: "28px 20px 18px", borderBottom: "1px solid #D8D2C2" }}>
+      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+        <div>
+          <div style={{ fontSize: 13, color: "#6B6356", textTransform: "capitalize", letterSpacing: 0.3 }}>{today}</div>
+          <h1 style={{ ...styles.display, fontSize: 28, fontWeight: 600, margin: "4px 0 0" }}>
+            Salut, {profile.prenom}
+          </h1>
+        </div>
+        <button
+          onClick={onEditProfile}
+          style={{
+            ...styles.mono,
+            fontSize: 11,
+            background: "#3F5C49",
+            color: "#F6F3EC",
+            padding: "5px 10px",
+            borderRadius: 20,
+            border: "none",
+            cursor: "pointer",
+            marginTop: 3,
+          }}
+        >
+          {profile.goal}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ---------- tab bar ----------
+function TabBar({ tabs, active, setActive }) {
+  return (
+    <div
+      style={{
+        position: "fixed",
+        bottom: 0,
+        left: 0,
+        right: 0,
+        background: "#15201C",
+        display: "flex",
+        justifyContent: "center",
+      }}
+    >
+      <div style={{ display: "flex", width: "100%", maxWidth: 480 }}>
+        {tabs.map((t) => {
+          const Icon = t.icon;
+          const isActive = active === t.id;
+          return (
+            <button
+              key={t.id}
+              onClick={() => setActive(t.id)}
+              style={{
+                flex: 1,
+                background: "none",
+                border: "none",
+                padding: "14px 0 16px",
+                display: "flex",
+                flexDirection: "column",
+                alignItems: "center",
+                gap: 4,
+                cursor: "pointer",
+                color: isActive ? "#E8E1D2" : "#6B7A70",
+              }}
+            >
+              <Icon size={19} strokeWidth={isActive ? 2.2 : 1.8} />
+              <span style={{ fontSize: 10.5, letterSpacing: 0.2 }}>{t.label}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ---------- card shell ----------
+function Card({ children, style }) {
+  return (
+    <div
+      style={{
+        background: "#FFFFFF",
+        border: "1px solid #E4DECF",
+        borderRadius: 14,
+        padding: 18,
+        marginTop: 16,
+        ...style,
+      }}
+    >
+      {children}
+    </div>
+  );
+}
+
+function SectionLabel({ children }) {
+  return (
+    <div style={{ ...styles.mono, fontSize: 11, color: "#8A8270", letterSpacing: 0.6, textTransform: "uppercase", marginBottom: 10 }}>
+      {children}
+    </div>
+  );
+}
+
+// ---------- NUTRITION AGENT ----------
+function NutritionAgent({ meals, setMeals }) {
+  const [mode, setMode] = useState("photo");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [pendingImage, setPendingImage] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [error, setError] = useState(null);
+  const inputRef = useRef(null);
+
+  // audio
+  const speech = useSpeechToText();
+
+  // manual
+  const [manual, setManual] = useState({ name: "", kcal: "", proteines: "", glucides: "", lipides: "" });
+
+  const NUTRITION_MODES = [
+    { id: "photo", label: "Photo", icon: Camera },
+    { id: "audio", label: "Audio", icon: Mic },
+    { id: "manuel", label: "Manuel", icon: Keyboard },
+  ];
+
+  async function handleFile(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    setDraft(null);
+    setAnalyzing(true);
+    try {
+      const base64 = await fileToBase64(file);
+      setPendingImage(`data:${file.type};base64,${base64}`);
+
+      const prompt = `Tu es un agent de reconnaissance alimentaire. Analyse cette photo de repas et réponds UNIQUEMENT en JSON, sans aucun texte autour, avec ce format exact:
+{
+  "items": [{"name": "string", "portion_estimee": "string", "kcal": number, "proteines_g": number, "glucides_g": number, "lipides_g": number}],
+  "kcal_total": number,
+  "confiance": "haute" | "moyenne" | "basse",
+  "question_pour_utilisateur": "string ou null si aucune ambiguïté"
+}
+Sois réaliste sur les portions à partir de repères visuels (taille d'assiette, couverts). Si l'image n'est pas un repas, retourne items vide et confiance basse.`;
+
+      const text = await callClaude([
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: file.type, data: base64 } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ]);
+      const parsed = parseJsonLoose(text);
+      if (!parsed) throw new Error("parse_failed");
+      setDraft(parsed);
+    } catch (err) {
+      setError("L'analyse a échoué. Réessaie avec une autre photo, ou utilise le mode audio ou manuel.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function analyzeAudioTranscript(transcript) {
+    if (!transcript.trim()) return;
+    setError(null);
+    setAnalyzing(true);
+    try {
+      const prompt = `Tu es un agent de reconnaissance alimentaire. Voici la description orale d'un repas, retranscrite en texte: "${transcript}"
+Réponds UNIQUEMENT en JSON avec ce format exact:
+{
+  "items": [{"name": "string", "portion_estimee": "string", "kcal": number, "proteines_g": number, "glucides_g": number, "lipides_g": number}],
+  "kcal_total": number,
+  "confiance": "haute" | "moyenne" | "basse",
+  "question_pour_utilisateur": "string ou null si aucune ambiguïté"
+}
+Estime les portions de façon réaliste même si elles ne sont pas précisées (ex: "une assiette de pâtes" = portion standard ~350g cuites).`;
+      const text = await callClaude([{ role: "user", content: prompt }]);
+      const parsed = parseJsonLoose(text);
+      if (!parsed) throw new Error("parse_failed");
+      setDraft(parsed);
+      setPendingImage(null);
+    } catch {
+      setError("Impossible d'interpréter la description. Réessaie ou passe en mode manuel.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  function confirmMeal() {
+    if (!draft) return;
+    setMeals((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        time: new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
+        items: draft.items,
+        kcal: draft.kcal_total,
+        image: pendingImage,
+      },
+    ]);
+    setDraft(null);
+    setPendingImage(null);
+    speech.setTranscript("");
+    if (inputRef.current) inputRef.current.value = "";
+  }
+
+  function addManualMeal() {
+    const kcal = parseFloat(manual.kcal) || 0;
+    if (!manual.name.trim() || !kcal) return;
+    setMeals((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        time: new Date().toLocaleTimeString("fr-FR", { hour: "2-digit", minute: "2-digit" }),
+        items: [
+          {
+            name: manual.name,
+            portion_estimee: "saisie manuelle",
+            kcal,
+            proteines_g: parseFloat(manual.proteines) || 0,
+            glucides_g: parseFloat(manual.glucides) || 0,
+            lipides_g: parseFloat(manual.lipides) || 0,
+          },
+        ],
+        kcal,
+        image: null,
+      },
+    ]);
+    setManual({ name: "", kcal: "", proteines: "", glucides: "", lipides: "" });
+  }
+
+  return (
+    <div>
+      <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+        <SectionLabelDark>Agent Nutrition</SectionLabelDark>
+        <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 14px", lineHeight: 1.3 }}>
+          Photo, voix ou saisie — choisis ce qui va le plus vite.
+        </p>
+
+        <ModeSelector mode={mode} setMode={setMode} modes={NUTRITION_MODES} />
+
+        {mode === "photo" && (
+          <>
+            <input ref={inputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} id="meal-upload" />
+            <label
+              htmlFor="meal-upload"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                background: "#E8E1D2",
+                color: "#15201C",
+                borderRadius: 10,
+                padding: "12px 0",
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: "pointer",
+              }}
+            >
+              <Camera size={17} /> Ajouter un repas
+            </label>
+          </>
+        )}
+
+        {mode === "audio" && (
+          <AudioCapture
+            speech={speech}
+            onSubmit={analyzeAudioTranscript}
+            placeholder="Ex: « j'ai mangé une assiette de pâtes au saumon avec un peu de parmesan »"
+          />
+        )}
+
+        {mode === "manuel" && (
+          <ManualMealForm manual={manual} setManual={setManual} onSubmit={addManualMeal} />
+        )}
+      </Card>
+
+      {analyzing && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#6B6356" }}>
+            <Spinner /> {mode === "audio" ? "Interprétation de la description en cours…" : "Reconnaissance des aliments en cours…"}
+          </div>
+        </Card>
+      )}
+
+      {error && (
+        <Card style={{ borderColor: "#C76B3E" }}>
+          <div style={{ color: "#C76B3E", fontSize: 14 }}>{error}</div>
+        </Card>
+      )}
+
+      {draft && (
+        <Card>
+          <SectionLabel>Résultat de l'analyse</SectionLabel>
+          {pendingImage && (
+            <img src={pendingImage} alt="repas" style={{ width: "100%", height: 160, objectFit: "cover", borderRadius: 10, marginBottom: 12 }} />
+          )}
+          {draft.items?.length === 0 ? (
+            <p style={{ fontSize: 14, color: "#6B6356" }}>Aucun aliment détecté avec assez de confiance.</p>
+          ) : (
+            <>
+              {draft.items.map((it, i) => (
+                <div key={i} style={{ display: "flex", justifyContent: "space-between", padding: "7px 0", borderBottom: i < draft.items.length - 1 ? "1px solid #EFEAE0" : "none" }}>
+                  <div>
+                    <div style={{ fontSize: 14, fontWeight: 500 }}>{it.name}</div>
+                    <div style={{ fontSize: 12, color: "#8A8270" }}>{it.portion_estimee}</div>
+                  </div>
+                  <div style={{ ...styles.mono, fontSize: 14 }}>{it.kcal} kcal</div>
+                </div>
+              ))}
+              <div style={{ display: "flex", justifyContent: "space-between", marginTop: 12, paddingTop: 12, borderTop: "1px solid #D8D2C2" }}>
+                <span style={{ fontWeight: 600, fontSize: 14 }}>Total estimé</span>
+                <span style={{ ...styles.mono, fontWeight: 600, fontSize: 16 }}>{draft.kcal_total} kcal</span>
+              </div>
+              <ConfidenceBadge level={draft.confiance} />
+              {draft.question_pour_utilisateur && (
+                <div style={{ marginTop: 12, fontSize: 13, background: "#F6F3EC", padding: 10, borderRadius: 8, color: "#3F5C49" }}>
+                  L'agent demande : {draft.question_pour_utilisateur}
+                </div>
+              )}
+              <button
+                onClick={confirmMeal}
+                style={{
+                  marginTop: 14,
+                  width: "100%",
+                  background: "#3F5C49",
+                  color: "#F6F3EC",
+                  border: "none",
+                  borderRadius: 9,
+                  padding: "11px 0",
+                  fontWeight: 600,
+                  fontSize: 14,
+                  cursor: "pointer",
+                }}
+              >
+                Confirmer ce repas
+              </button>
+            </>
+          )}
+        </Card>
+      )}
+
+      {meals.length > 0 && (
+        <Card>
+          <SectionLabel>Repas du jour ({meals.length})</SectionLabel>
+          {meals.map((m) => (
+            <div key={m.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "8px 0", borderBottom: "1px solid #EFEAE0" }}>
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                {m.image && <img src={m.image} alt="" style={{ width: 36, height: 36, borderRadius: 8, objectFit: "cover" }} />}
+                <div>
+                  <div style={{ fontSize: 13 }}>{m.items.map((i) => i.name).join(", ")}</div>
+                  <div style={{ fontSize: 11, color: "#8A8270" }}>{m.time}</div>
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ ...styles.mono, fontSize: 13 }}>{m.kcal} kcal</span>
+                <button onClick={() => setMeals((prev) => prev.filter((x) => x.id !== m.id))} style={{ border: "none", background: "none", cursor: "pointer", color: "#C76B3E" }}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ---------- shared: audio capture ----------
+function AudioCapture({ speech, onSubmit, placeholder }) {
+  if (speech.unsupported) {
+    return (
+      <div style={{ fontSize: 13, color: "#A8A493", lineHeight: 1.5 }}>
+        La reconnaissance vocale n'est pas disponible sur ce navigateur. Utilise le mode manuel ou photo à la place.
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      <button
+        onClick={speech.listening ? speech.stop : speech.start}
+        style={{
+          width: "100%",
+          display: "flex",
+          alignItems: "center",
+          justifyContent: "center",
+          gap: 8,
+          background: speech.listening ? "#A8453A" : "#E8E1D2",
+          color: speech.listening ? "#F6F3EC" : "#15201C",
+          border: "none",
+          borderRadius: 10,
+          padding: "12px 0",
+          fontWeight: 600,
+          fontSize: 14,
+          cursor: "pointer",
+        }}
+      >
+        {speech.listening ? <Square size={15} /> : <Mic size={17} />}
+        {speech.listening ? "Arrêter l'enregistrement" : "Parler de ton repas"}
+      </button>
+
+      <div
+        style={{
+          marginTop: 10,
+          minHeight: 50,
+          background: "#1F2A24",
+          border: "1px solid #3A453E",
+          borderRadius: 10,
+          padding: 12,
+          fontSize: 13.5,
+          color: speech.transcript ? "#F6F3EC" : "#6B7A70",
+        }}
+      >
+        {speech.transcript || placeholder}
+      </div>
+
+      {speech.transcript && !speech.listening && (
+        <button
+          onClick={() => onSubmit(speech.transcript)}
+          style={{
+            marginTop: 10,
+            width: "100%",
+            background: "#3F5C49",
+            color: "#F6F3EC",
+            border: "none",
+            borderRadius: 9,
+            padding: "11px 0",
+            fontWeight: 600,
+            fontSize: 14,
+            cursor: "pointer",
+          }}
+        >
+          Analyser cette description
+        </button>
+      )}
+    </div>
+  );
+}
+
+// ---------- nutrition: manual form ----------
+function ManualMealForm({ manual, setManual, onSubmit }) {
+  const inputStyle = {
+    width: "100%",
+    background: "#1F2A24",
+    color: "#F6F3EC",
+    border: "1px solid #3A453E",
+    borderRadius: 9,
+    padding: "10px 12px",
+    fontSize: 14,
+    fontFamily: "inherit",
+    boxSizing: "border-box",
+    marginBottom: 8,
+  };
+  return (
+    <div>
+      <input
+        placeholder="Nom du repas (ex: poulet riz brocolis)"
+        value={manual.name}
+        onChange={(e) => setManual((m) => ({ ...m, name: e.target.value }))}
+        style={inputStyle}
+      />
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+        <input placeholder="Kcal" type="number" value={manual.kcal} onChange={(e) => setManual((m) => ({ ...m, kcal: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+        <input placeholder="Protéines (g)" type="number" value={manual.proteines} onChange={(e) => setManual((m) => ({ ...m, proteines: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+      </div>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+        <input placeholder="Glucides (g)" type="number" value={manual.glucides} onChange={(e) => setManual((m) => ({ ...m, glucides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+        <input placeholder="Lipides (g)" type="number" value={manual.lipides} onChange={(e) => setManual((m) => ({ ...m, lipides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+      </div>
+      <button
+        onClick={onSubmit}
+        style={{
+          width: "100%",
+          background: "#E8E1D2",
+          color: "#15201C",
+          border: "none",
+          borderRadius: 9,
+          padding: "11px 0",
+          fontWeight: 600,
+          fontSize: 14,
+          cursor: "pointer",
+        }}
+      >
+        Ajouter le repas
+      </button>
+    </div>
+  );
+}
+
+function SectionLabelDark({ children }) {
+  return (
+    <div style={{ ...styles.mono, fontSize: 11, color: "#A8A493", letterSpacing: 0.6, textTransform: "uppercase", marginBottom: 6 }}>
+      {children}
+    </div>
+  );
+}
+
+function ConfidenceBadge({ level }) {
+  const map = {
+    haute: { bg: "#3F5C49", label: "Confiance haute" },
+    moyenne: { bg: "#C76B3E", label: "Confiance moyenne — vérifie les portions" },
+    basse: { bg: "#A8453A", label: "Confiance basse — corrige si besoin" },
+  };
+  const v = map[level] || map.moyenne;
+  return (
+    <div style={{ marginTop: 10, display: "inline-block", ...styles.mono, fontSize: 11, color: "#fff", background: v.bg, padding: "4px 9px", borderRadius: 20 }}>
+      {v.label}
+    </div>
+  );
+}
+
+function Spinner() {
+  return (
+    <div
+      style={{
+        width: 16,
+        height: 16,
+        borderRadius: "50%",
+        border: "2px solid #D8D2C2",
+        borderTopColor: "#3F5C49",
+        animation: "fc-spin 0.8s linear infinite",
+      }}
+    >
+      <style>{`@keyframes fc-spin { to { transform: rotate(360deg); } }`}</style>
+    </div>
+  );
+}
+
+// ---------- TRAINING AGENT ----------
+const ACTIVITIES = ["Course à pied", "Musculation", "Vélo", "Natation", "HIIT", "Yoga", "Marche", "Autre"];
+const INTENSITES = ["faible", "modérée", "élevée"];
+
+function TrainingAgent({ workouts, setWorkouts }) {
+  const [mode, setMode] = useState("audio");
+  const [text, setText] = useState("");
+  const [analyzing, setAnalyzing] = useState(false);
+  const [error, setError] = useState(null);
+  const speech = useSpeechToText();
+  const photoInputRef = useRef(null);
+  const [pendingImage, setPendingImage] = useState(null);
+
+  const [manual, setManual] = useState({ type: ACTIVITIES[0], duree: "", intensite: "modérée", kcal: "" });
+
+  const TRAINING_MODES = [
+    { id: "texte", label: "Texte", icon: Keyboard },
+    { id: "audio", label: "Audio", icon: Mic },
+    { id: "photo", label: "Photo", icon: Camera },
+    { id: "manuel", label: "Manuel", icon: Plus },
+  ];
+
+  async function analyzeText(description) {
+    if (!description.trim()) return;
+    setAnalyzing(true);
+    setError(null);
+    try {
+      const prompt = `Tu es un agent d'estimation de dépense énergétique à l'entraînement. À partir de cette description en langage libre d'une séance, réponds UNIQUEMENT en JSON:
+{
+  "type": "string",
+  "duree_min": number,
+  "intensite": "faible" | "modérée" | "élevée",
+  "kcal_estime": number,
+  "resume": "string courte phrase"
+}
+Description de la séance: "${description}"
+Base-toi sur une personne de profil moyen actif (~70kg) si aucune donnée n'est fournie. Sois réaliste, pas optimiste.`;
+      const out = await callClaude([{ role: "user", content: prompt }]);
+      const parsed = parseJsonLoose(out);
+      if (!parsed) throw new Error("parse_failed");
+      setWorkouts((prev) => [...prev, { id: Date.now(), ...parsed }]);
+      setText("");
+      speech.setTranscript("");
+    } catch {
+      setError("Impossible d'analyser cette séance. Reformule, ou utilise le mode manuel.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  async function handlePhoto(e) {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setError(null);
+    setAnalyzing(true);
+    try {
+      const base64 = await fileToBase64(file);
+      setPendingImage(`data:${file.type};base64,${base64}`);
+
+      const prompt = `Tu es un agent d'estimation de dépense énergétique à l'entraînement. L'image montre soit un tableau de séance écrit (ex: salle de CrossFit/musculation), soit l'écran d'une machine de cardio (rameur, vélo, tapis, etc). Lis les informations visibles (type d'effort, durée, distance, calories affichées, séries, répétitions, watts...) et réponds UNIQUEMENT en JSON:
+{
+  "type": "string",
+  "duree_min": number,
+  "intensite": "faible" | "modérée" | "élevée",
+  "kcal_estime": number,
+  "resume": "string décrivant ce qui a été lu sur l'image"
+}
+Si la machine affiche directement des calories, utilise cette valeur en priorité plutôt que d'estimer. Si l'image est illisible ou ne correspond à aucune séance, mets kcal_estime à 0 et explique dans resume.`;
+
+      const out = await callClaude([
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: file.type, data: base64 } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ]);
+      const parsed = parseJsonLoose(out);
+      if (!parsed) throw new Error("parse_failed");
+      if (!parsed.kcal_estime) {
+        setError(parsed.resume || "Impossible de lire les données sur cette image. Essaie une photo plus nette ou un autre mode.");
+      } else {
+        setWorkouts((prev) => [...prev, { id: Date.now(), ...parsed }]);
+        setPendingImage(null);
+      }
+    } catch {
+      setError("L'analyse de l'image a échoué. Réessaie ou utilise un autre mode.");
+    } finally {
+      setAnalyzing(false);
+      if (photoInputRef.current) photoInputRef.current.value = "";
+    }
+  }
+
+  function addManualWorkout() {
+    const duree = parseFloat(manual.duree) || 0;
+    const kcal = parseFloat(manual.kcal) || 0;
+    if (!duree || !kcal) return;
+    setWorkouts((prev) => [
+      ...prev,
+      {
+        id: Date.now(),
+        type: manual.type,
+        duree_min: duree,
+        intensite: manual.intensite,
+        kcal_estime: kcal,
+      },
+    ]);
+    setManual({ type: ACTIVITIES[0], duree: "", intensite: "modérée", kcal: "" });
+  }
+
+  return (
+    <div>
+      <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+        <SectionLabelDark>Agent Entraînement</SectionLabelDark>
+        <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 14px", lineHeight: 1.3 }}>
+          Raconte ta séance, parle-la, prends-la en photo, ou saisis-la.
+        </p>
+
+        <ModeSelector mode={mode} setMode={setMode} modes={TRAINING_MODES} />
+
+        {mode === "texte" && (
+          <>
+            <textarea
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Ex: 45 min de course à allure modérée, un peu de dénivelé"
+              rows={3}
+              style={{
+                width: "100%",
+                background: "#1F2A24",
+                color: "#F6F3EC",
+                border: "1px solid #3A453E",
+                borderRadius: 10,
+                padding: 12,
+                fontSize: 14,
+                fontFamily: "inherit",
+                resize: "none",
+                boxSizing: "border-box",
+              }}
+            />
+            <button
+              onClick={() => analyzeText(text)}
+              disabled={analyzing || !text.trim()}
+              style={{
+                marginTop: 10,
+                width: "100%",
+                background: "#E8E1D2",
+                color: "#15201C",
+                border: "none",
+                borderRadius: 9,
+                padding: "11px 0",
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: analyzing ? "default" : "pointer",
+                opacity: analyzing ? 0.6 : 1,
+              }}
+            >
+              {analyzing ? "Estimation en cours…" : "Estimer la dépense"}
+            </button>
+          </>
+        )}
+
+        {mode === "audio" && (
+          <AudioCapture
+            speech={speech}
+            onSubmit={analyzeText}
+            placeholder="Ex: « j'ai fait 45 minutes de course, allure modérée, un peu de dénivelé »"
+          />
+        )}
+
+        {mode === "photo" && (
+          <>
+            <input ref={photoInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display: "none" }} id="workout-photo" />
+            <label
+              htmlFor="workout-photo"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: 8,
+                background: "#E8E1D2",
+                color: "#15201C",
+                borderRadius: 10,
+                padding: "12px 0",
+                fontWeight: 600,
+                fontSize: 14,
+                cursor: "pointer",
+              }}
+            >
+              <Camera size={17} /> Photographier un tableau ou un écran
+            </label>
+            <p style={{ fontSize: 11.5, color: "#A8A493", marginTop: 8, marginBottom: 0, lineHeight: 1.4 }}>
+              Tableau de séance affiché en salle, écran de rameur, vélo ou tapis.
+            </p>
+          </>
+        )}
+
+        {mode === "manuel" && (
+          <ManualWorkoutForm manual={manual} setManual={setManual} onSubmit={addManualWorkout} />
+        )}
+      </Card>
+
+      {pendingImage && analyzing && (
+        <Card>
+          <img src={pendingImage} alt="séance" style={{ width: "100%", height: 160, objectFit: "cover", borderRadius: 10 }} />
+        </Card>
+      )}
+
+      {analyzing && (
+        <Card>
+          <div style={{ display: "flex", alignItems: "center", gap: 10, color: "#6B6356" }}>
+            <Spinner /> {mode === "photo" ? "Lecture de l'image en cours…" : "Estimation de la dépense en cours…"}
+          </div>
+        </Card>
+      )}
+
+      {error && (
+        <Card style={{ borderColor: "#C76B3E" }}>
+          <div style={{ color: "#C76B3E", fontSize: 14 }}>{error}</div>
+        </Card>
+      )}
+
+      {workouts.length > 0 && (
+        <Card>
+          <SectionLabel>Séances du jour ({workouts.length})</SectionLabel>
+          {workouts.map((w) => (
+            <div key={w.id} style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "9px 0", borderBottom: "1px solid #EFEAE0" }}>
+              <div>
+                <div style={{ fontSize: 13, fontWeight: 500 }}>{w.type}</div>
+                <div style={{ fontSize: 11, color: "#8A8270" }}>
+                  {w.duree_min} min · intensité {w.intensite}
+                </div>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                <span style={{ ...styles.mono, fontSize: 13 }}>{w.kcal_estime} kcal</span>
+                <button onClick={() => setWorkouts((prev) => prev.filter((x) => x.id !== w.id))} style={{ border: "none", background: "none", cursor: "pointer", color: "#C76B3E" }}>
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </Card>
+      )}
+    </div>
+  );
+}
+
+// ---------- training: manual form ----------
+function ManualWorkoutForm({ manual, setManual, onSubmit }) {
+  const inputStyle = {
+    width: "100%",
+    background: "#1F2A24",
+    color: "#F6F3EC",
+    border: "1px solid #3A453E",
+    borderRadius: 9,
+    padding: "10px 12px",
+    fontSize: 14,
+    fontFamily: "inherit",
+    boxSizing: "border-box",
+  };
+  return (
+    <div>
+      <select
+        value={manual.type}
+        onChange={(e) => setManual((m) => ({ ...m, type: e.target.value }))}
+        style={{ ...inputStyle, marginBottom: 8 }}
+      >
+        {ACTIVITIES.map((a) => (
+          <option key={a} value={a}>
+            {a}
+          </option>
+        ))}
+      </select>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+        <input
+          placeholder="Durée (min)"
+          type="number"
+          value={manual.duree}
+          onChange={(e) => setManual((m) => ({ ...m, duree: e.target.value }))}
+          style={inputStyle}
+        />
+        <input
+          placeholder="Kcal estimées"
+          type="number"
+          value={manual.kcal}
+          onChange={(e) => setManual((m) => ({ ...m, kcal: e.target.value }))}
+          style={inputStyle}
+        />
+      </div>
+      <select
+        value={manual.intensite}
+        onChange={(e) => setManual((m) => ({ ...m, intensite: e.target.value }))}
+        style={{ ...inputStyle, marginBottom: 10 }}
+      >
+        {INTENSITES.map((i) => (
+          <option key={i} value={i}>
+            Intensité {i}
+          </option>
+        ))}
+      </select>
+      <button
+        onClick={onSubmit}
+        style={{
+          width: "100%",
+          background: "#E8E1D2",
+          color: "#15201C",
+          border: "none",
+          borderRadius: 9,
+          padding: "11px 0",
+          fontWeight: 600,
+          fontSize: 14,
+          cursor: "pointer",
+        }}
+      >
+        Ajouter la séance
+      </button>
+    </div>
+  );
+}
+
+// ---------- BIOMETRICS AGENT ----------
+function BiometricsAgent({ bio, setBio }) {
+  const fields = [
+    { key: "restingHR", label: "FC repos", unit: "bpm", icon: Heart, step: 1 },
+    { key: "hrv", label: "VFC", unit: "ms", icon: Activity, step: 1 },
+    { key: "sleepHours", label: "Sommeil", unit: "h", icon: Moon, step: 0.1 },
+    { key: "steps", label: "Pas", unit: "", icon: Footprints, step: 100 },
+    { key: "weight", label: "Poids", unit: "kg", icon: Scale, step: 0.1 },
+  ];
+
+  function update(key, value) {
+    setBio((prev) => ({ ...prev, [key]: value }));
+  }
+
+  return (
+    <div>
+      <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+        <SectionLabelDark>Agent Biométrie</SectionLabelDark>
+        <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 6px", lineHeight: 1.3 }}>
+          Simule une synchronisation montre.
+        </p>
+        <p style={{ fontSize: 12.5, color: "#A8A493", margin: 0 }}>
+          Dans la version finale, ces valeurs viendraient d'Apple Health, Garmin ou Whoop. Ici, ajuste-les pour voir comment elles influencent le coach.
+        </p>
+      </Card>
+
+      <Card>
+        {fields.map((f, i) => {
+          const Icon = f.icon;
+          return (
+            <div
+              key={f.key}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "space-between",
+                padding: "12px 0",
+                borderBottom: i < fields.length - 1 ? "1px solid #EFEAE0" : "none",
+              }}
+            >
+              <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                <div style={{ width: 32, height: 32, borderRadius: 8, background: "#F6F3EC", display: "flex", alignItems: "center", justifyContent: "center" }}>
+                  <Icon size={15} color="#3F5C49" />
+                </div>
+                <span style={{ fontSize: 14 }}>{f.label}</span>
+              </div>
+              <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                <input
+                  type="number"
+                  value={bio[f.key]}
+                  step={f.step}
+                  onChange={(e) => update(f.key, parseFloat(e.target.value) || 0)}
+                  style={{
+                    width: 70,
+                    ...styles.mono,
+                    fontSize: 14,
+                    textAlign: "right",
+                    border: "1px solid #D8D2C2",
+                    borderRadius: 7,
+                    padding: "6px 8px",
+                  }}
+                />
+                <span style={{ fontSize: 12, color: "#8A8270", width: 24 }}>{f.unit}</span>
+              </div>
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+// ---------- COACH AGENT ----------
+function CoachAgent({ profile, meals, workouts, bio, totalIntake, totalBurn }) {
+  const [advice, setAdvice] = useState(null);
+  const [loading, setLoading] = useState(false);
+
+  // BMR via Mifflin-St Jeor, ajusté par sommeil/pas
+  const sexFactor = profile.sexe === "Homme" ? 5 : profile.sexe === "Femme" ? -161 : -78;
+  const baseBMR = Math.round(10 * (profile.poids || 70) + 6.25 * (profile.taille || 170) - 5 * (profile.age || 30) + sexFactor);
+  const stepsBurn = Math.round(bio.steps * 0.04);
+  const sleepFactor = bio.sleepHours < 6.5 ? 0.96 : 1;
+  const totalExpenditure = Math.round((baseBMR + stepsBurn + totalBurn) * sleepFactor);
+  const balance = totalIntake - totalExpenditure;
+  const targetBalance = profile.targetSurplus ?? 0;
+  const gap = targetBalance - balance;
+
+  async function askCoach() {
+    setLoading(true);
+    try {
+      const prompt = `Tu es un coach sportif et nutrition. Voici les données du jour pour ${profile.prenom}, ${profile.age} ans, objectif: ${profile.goal}.
+Dépense énergétique totale estimée: ${totalExpenditure} kcal (métabolisme de base + pas + sport).
+Apport alimentaire: ${totalIntake} kcal sur ${meals.length} repas.
+Séances: ${workouts.map((w) => `${w.type} (${w.duree_min}min, ${w.kcal_estime}kcal)`).join(", ") || "aucune"}.
+Biométrie: FC repos ${bio.restingHR}bpm, VFC ${bio.hrv}ms, sommeil ${bio.sleepHours}h, pas ${bio.steps}, poids ${bio.weight}kg.
+Objectif calorique pour l'objectif "${profile.goal}": un delta d'environ ${targetBalance >= 0 ? "+" : ""}${targetBalance} kcal/jour par rapport à la dépense.
+
+Donne un message de coach direct, chaleureux mais factuel, en 3-4 phrases maximum, en français, qui:
+1. Résume où en est la personne par rapport à son objectif
+2. Donne une recommandation concrète et actionnable pour la fin de journée
+Ne donne pas de liste, écris en prose, ton de coach personnel. Adresse-toi à ${profile.prenom} directement.`;
+      const text = await callClaude([{ role: "user", content: prompt }]);
+      setAdvice(text.trim());
+    } catch {
+      setAdvice("Le coach n'a pas pu analyser tes données pour le moment. Réessaie dans un instant.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div>
+      <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+        <SectionLabelDark>Agent Coach</SectionLabelDark>
+        <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 14px", lineHeight: 1.3 }}>
+          Toutes les données, une seule voix.
+        </p>
+        <button
+          onClick={askCoach}
+          disabled={loading}
+          style={{
+            width: "100%",
+            background: "#E8E1D2",
+            color: "#15201C",
+            border: "none",
+            borderRadius: 9,
+            padding: "11px 0",
+            fontWeight: 600,
+            fontSize: 14,
+            cursor: loading ? "default" : "pointer",
+            opacity: loading ? 0.6 : 1,
+          }}
+        >
+          {loading ? "Le coach analyse…" : "Demander un point au coach"}
+        </button>
+      </Card>
+
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, marginTop: 16 }}>
+        <StatBlock icon={Flame} label="Dépense estimée" value={totalExpenditure} unit="kcal" />
+        <StatBlock icon={Sparkles} label="Apport" value={totalIntake} unit="kcal" />
+      </div>
+
+      <Card>
+        <SectionLabel>Bilan énergétique</SectionLabel>
+        <BalanceBar intake={totalIntake} expenditure={totalExpenditure} />
+        <div style={{ marginTop: 12, fontSize: 13, color: "#6B6356", lineHeight: 1.5 }}>
+          Solde actuel : <strong style={{ color: balance >= 0 ? "#3F5C49" : "#A8453A" }}>{balance >= 0 ? "+" : ""}{balance} kcal</strong>{" "}
+          — objectif {profile.goal.toLowerCase()} : <strong>+{targetBalance} kcal</strong>.{" "}
+          {gap > 0 ? (
+            <>Il manque environ <strong>{gap} kcal</strong> pour atteindre l'objectif du jour.</>
+          ) : (
+            <>Objectif du jour atteint ou dépassé.</>
+          )}
+        </div>
+      </Card>
+
+      {advice && (
+        <Card style={{ background: "#3F5C49", border: "none" }}>
+          <SectionLabelDark>Message du coach</SectionLabelDark>
+          <p style={{ color: "#F6F3EC", fontSize: 15, lineHeight: 1.55, margin: 0, ...styles.display, fontWeight: 400 }}>
+            {advice}
+          </p>
+        </Card>
+      )}
+    </div>
+  );
+}
+
+function StatBlock({ icon: Icon, label, value, unit }) {
+  return (
+    <Card style={{ marginTop: 0, padding: 14 }}>
+      <Icon size={16} color="#C76B3E" />
+      <div style={{ ...styles.mono, fontSize: 22, fontWeight: 600, marginTop: 8 }}>{value}</div>
+      <div style={{ fontSize: 11, color: "#8A8270", marginTop: 2 }}>
+        {label} {unit && `(${unit})`}
+      </div>
+    </Card>
+  );
+}
+
+function BalanceBar({ intake, expenditure }) {
+  const max = Math.max(intake, expenditure, 1);
+  return (
+    <div>
+      <BarRow label="Dépense" value={expenditure} max={max} color="#C76B3E" />
+      <BarRow label="Apport" value={intake} max={max} color="#3F5C49" />
+    </div>
+  );
+}
+
+function BarRow({ label, value, max, color }) {
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: "#6B6356", marginBottom: 4 }}>
+        <span>{label}</span>
+        <span style={styles.mono}>{value} kcal</span>
+      </div>
+      <div style={{ background: "#EFEAE0", borderRadius: 6, height: 8, overflow: "hidden" }}>
+        <div style={{ width: `${Math.min((value / max) * 100, 100)}%`, height: "100%", background: color, borderRadius: 6 }} />
+      </div>
+    </div>
+  );
+}
