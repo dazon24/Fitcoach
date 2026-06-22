@@ -16,8 +16,14 @@ export default async function handler(req, res) {
     });
 
     const data = await response.json();
+
+    // Log pour debug : affiche le statut et la réponse d'Anthropic
+    console.log("Anthropic status:", response.status);
+    console.log("Anthropic response:", JSON.stringify(data));
+
     res.status(response.status).json(data);
   } catch (err) {
+    console.log("Erreur fonction:", String(err));
     res.status(500).json({ error: "Erreur serveur", details: String(err) });
   }
 }
