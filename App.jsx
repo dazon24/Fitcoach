@@ -1,5 +1,5 @@
 import React, { useState, useRef } from "react";
-import { Camera, Dumbbell, Activity, Sparkles, Plus, Trash2, ChevronRight, Flame, Moon, Heart, Footprints, Scale, Mic, Keyboard, Square, Image as ImageIcon } from "lucide-react";
+import { Camera, Dumbbell, Activity, Sparkles, Plus, Trash2, ChevronRight, Flame, Moon, Heart, Footprints, Scale, Mic, Keyboard, Square, Image as ImageIcon, CalendarDays, TrendingUp } from "lucide-react";
 
 // ---------- helpers ----------
 const fileToBase64 = (file) =>
@@ -25,6 +25,59 @@ async function callClaude(messages, { vision } = {}) {
     .map((b) => (b.type === "text" ? b.text : ""))
     .join("\n");
   return text;
+}
+
+// ---------- persistance locale ----------
+const STORE_KEY = "fitcoach_data_v2";
+
+function todayStr() {
+  return new Date().toISOString().slice(0, 10); // AAAA-MM-JJ
+}
+
+function loadStore() {
+  try {
+    const raw = localStorage.getItem(STORE_KEY);
+    if (!raw) return null;
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+function saveStore(data) {
+  try {
+    localStorage.setItem(STORE_KEY, JSON.stringify(data));
+  } catch {
+    // stockage indisponible (mode privé strict) : on ignore silencieusement
+  }
+}
+
+// Calcul de la dépense énergétique totale (partagé app + archive)
+function computeExpenditure(profile, bio, totalBurn) {
+  if (!profile) return 0;
+  const sexFactor = profile.sexe === "Homme" ? 5 : profile.sexe === "Femme" ? -161 : -78;
+  const baseBMR = Math.round(
+    10 * (profile.poids || 70) + 6.25 * (profile.taille || 170) - 5 * (profile.age || 30) + sexFactor
+  );
+  const stepsBurn = Math.round((bio?.steps || 0) * 0.04);
+  const sleepFactor = (bio?.sleepHours || 7) < 6.5 ? 0.96 : 1;
+  return Math.round((baseBMR + stepsBurn + totalBurn) * sleepFactor);
+}
+
+// Construit l'instantané d'une journée à archiver
+function buildDaySnapshot(profile, meals, workouts, bio) {
+  const intake = meals.reduce((s, m) => s + (m.kcal || 0), 0);
+  const burn = workouts.reduce((s, w) => s + (w.kcal_estime || 0), 0);
+  const expenditure = computeExpenditure(profile, bio, burn);
+  return {
+    meals,
+    workouts,
+    bio,
+    intake,
+    expenditure,
+    balance: intake - expenditure,
+    weight: bio?.weight ?? null,
+  };
 }
 
 function parseJsonLoose(text) {
@@ -143,23 +196,50 @@ function ModeSelector({ mode, setMode, modes }) {
 export default function App() {
   useInjectFonts();
   const [tab, setTab] = useState("nutrition");
-  const [profile, setProfile] = useState(null);
+
+  // Chargement initial depuis le stockage local
+  const stored = typeof window !== "undefined" ? loadStore() : null;
+  const isNewDay = !stored || stored.day !== todayStr();
+
+  const [profile, setProfile] = useState(stored?.profile || null);
   const [showProfileEdit, setShowProfileEdit] = useState(false);
 
-  const [meals, setMeals] = useState([]);
-  const [workouts, setWorkouts] = useState([]);
-  const [bio, setBio] = useState({
-    restingHR: 58,
-    sleepHours: 7.2,
-    steps: 8400,
-    weight: 68.4,
-    hrv: 52,
+  // Historique des jours passés : { "AAAA-MM-JJ": snapshot }
+  const [history, setHistory] = useState(() => {
+    const h = stored?.history || {};
+    // Si on change de jour ET qu'il y avait des données la veille, on archive
+    if (stored && isNewDay && stored.day) {
+      const hadData = (stored.meals?.length || 0) > 0 || (stored.workouts?.length || 0) > 0;
+      if (hadData) {
+        h[stored.day] = buildDaySnapshot(stored.profile, stored.meals || [], stored.workouts || [], stored.bio);
+      }
+    }
+    return h;
   });
+
+  // Jour courant : repart à vide si nouveau jour, sinon reprend l'existant
+  const [meals, setMeals] = useState(isNewDay ? [] : stored?.meals || []);
+  const [workouts, setWorkouts] = useState(isNewDay ? [] : stored?.workouts || []);
+  const [bio, setBio] = useState(
+    stored?.bio || {
+      restingHR: 58,
+      sleepHours: 7.2,
+      steps: 8400,
+      weight: 68.4,
+      hrv: 52,
+    }
+  );
+
+  // Sauvegarde automatique à chaque changement
+  React.useEffect(() => {
+    saveStore({ day: todayStr(), profile, meals, workouts, bio, history });
+  }, [profile, meals, workouts, bio, history]);
 
   const tabs = [
     { id: "nutrition", label: "Nutrition", icon: Camera },
     { id: "training", label: "Entraînement", icon: Dumbbell },
     { id: "biometrie", label: "Biométrie", icon: Activity },
+    { id: "historique", label: "Historique", icon: CalendarDays },
     { id: "coach", label: "Coach", icon: Sparkles },
   ];
 
@@ -187,6 +267,7 @@ export default function App() {
           {tab === "nutrition" && <NutritionAgent meals={meals} setMeals={setMeals} />}
           {tab === "training" && <TrainingAgent workouts={workouts} setWorkouts={setWorkouts} />}
           {tab === "biometrie" && <BiometricsAgent bio={bio} setBio={setBio} />}
+          {tab === "historique" && <HistoryAgent history={history} />}
           {tab === "coach" && (
             <CoachAgent
               profile={profile}
@@ -323,6 +404,33 @@ function ProfileSetup({ existing, onSave }) {
         >
           {existing ? "Enregistrer" : "Commencer"}
         </button>
+
+        {existing && (
+          <button
+            onClick={() => {
+              if (confirm("Effacer toutes les données (profil, repas, séances) et recommencer à zéro ?")) {
+                try {
+                  localStorage.removeItem(STORE_KEY);
+                } catch {}
+                window.location.reload();
+              }
+            }}
+            style={{
+              width: "100%",
+              marginTop: 12,
+              background: "transparent",
+              color: "#A8453A",
+              border: "1px solid #E0CFC9",
+              borderRadius: 10,
+              padding: "11px 0",
+              fontWeight: 500,
+              fontSize: 13.5,
+              cursor: "pointer",
+            }}
+          >
+            Réinitialiser toutes mes données
+          </button>
+        )}
       </div>
     </div>
   );
@@ -387,7 +495,7 @@ function TabBar({ tabs, active, setActive }) {
                 flex: 1,
                 background: "none",
                 border: "none",
-                padding: "14px 0 16px",
+                padding: "13px 2px 15px",
                 display: "flex",
                 flexDirection: "column",
                 alignItems: "center",
@@ -396,8 +504,8 @@ function TabBar({ tabs, active, setActive }) {
                 color: isActive ? "#E8E1D2" : "#6B7A70",
               }}
             >
-              <Icon size={19} strokeWidth={isActive ? 2.2 : 1.8} />
-              <span style={{ fontSize: 10.5, letterSpacing: 0.2 }}>{t.label}</span>
+              <Icon size={18} strokeWidth={isActive ? 2.2 : 1.8} />
+              <span style={{ fontSize: 9.5, letterSpacing: 0.1, textAlign: "center", lineHeight: 1.1 }}>{t.label}</span>
             </button>
           );
         })}
@@ -1252,17 +1360,172 @@ function BiometricsAgent({ bio, setBio }) {
   );
 }
 
+// ---------- HISTORY AGENT ----------
+function HistoryAgent({ history }) {
+  // Trie les jours du plus récent au plus ancien
+  const days = Object.keys(history || {}).sort((a, b) => b.localeCompare(a));
+
+  if (days.length === 0) {
+    return (
+      <div>
+        <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+          <SectionLabelDark>Agent Historique</SectionLabelDark>
+          <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 6px", lineHeight: 1.3 }}>
+            Pas encore d'historique.
+          </p>
+          <p style={{ fontSize: 12.5, color: "#A8A493", margin: 0, lineHeight: 1.5 }}>
+            Tes journées s'archivent automatiquement ici à partir de demain. Continue à enregistrer tes repas et séances aujourd'hui.
+          </p>
+        </Card>
+      </div>
+    );
+  }
+
+  // Données pour les graphiques (ordre chronologique croissant)
+  const chrono = [...days].reverse();
+  const labels = chrono.map((d) => {
+    const dt = new Date(d);
+    return dt.toLocaleDateString("fr-FR", { day: "2-digit", month: "2-digit" });
+  });
+  const intakeSeries = chrono.map((d) => history[d].intake || 0);
+  const expenditureSeries = chrono.map((d) => history[d].expenditure || 0);
+  const weightSeries = chrono.map((d) => history[d].weight || null);
+  const hasWeight = weightSeries.some((w) => w != null);
+
+  return (
+    <div>
+      <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
+        <SectionLabelDark>Agent Historique</SectionLabelDark>
+        <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 6px", lineHeight: 1.3 }}>
+          {days.length} jour{days.length > 1 ? "s" : ""} enregistré{days.length > 1 ? "s" : ""}.
+        </p>
+        <p style={{ fontSize: 12.5, color: "#A8A493", margin: 0, lineHeight: 1.5 }}>
+          Tes tendances sur la durée. Les données restent sur cet appareil.
+        </p>
+      </Card>
+
+      {/* Graphique apport vs dépense */}
+      <Card>
+        <SectionLabel>Apport vs dépense (kcal)</SectionLabel>
+        <MiniBars labels={labels} seriesA={intakeSeries} seriesB={expenditureSeries} colorA="#3F5C49" colorB="#C76B3E" legendA="Apport" legendB="Dépense" />
+      </Card>
+
+      {/* Graphique poids */}
+      {hasWeight && (
+        <Card>
+          <SectionLabel>Évolution du poids (kg)</SectionLabel>
+          <MiniLine labels={labels} values={weightSeries} color="#3F5C49" />
+        </Card>
+      )}
+
+      {/* Liste détaillée des jours */}
+      <Card>
+        <SectionLabel>Journal</SectionLabel>
+        {days.map((d) => {
+          const snap = history[d];
+          const dt = new Date(d);
+          const dateLabel = dt.toLocaleDateString("fr-FR", { weekday: "short", day: "numeric", month: "long" });
+          const balance = snap.balance ?? (snap.intake - snap.expenditure);
+          return (
+            <div key={d} style={{ padding: "11px 0", borderBottom: "1px solid #EFEAE0" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                <span style={{ fontSize: 13.5, fontWeight: 500, textTransform: "capitalize" }}>{dateLabel}</span>
+                <span style={{ ...styles.mono, fontSize: 12, color: balance >= 0 ? "#3F5C49" : "#A8453A" }}>
+                  {balance >= 0 ? "+" : ""}{balance} kcal
+                </span>
+              </div>
+              <div style={{ fontSize: 11.5, color: "#8A8270", marginTop: 3 }}>
+                {snap.intake} kcal absorbés · {snap.expenditure} kcal dépensés · {snap.meals?.length || 0} repas · {snap.workouts?.length || 0} séance{(snap.workouts?.length || 0) > 1 ? "s" : ""}
+              </div>
+            </div>
+          );
+        })}
+      </Card>
+    </div>
+  );
+}
+
+// Mini graphique en barres groupées (deux séries)
+function MiniBars({ labels, seriesA, seriesB, colorA, colorB, legendA, legendB }) {
+  const max = Math.max(...seriesA, ...seriesB, 1);
+  return (
+    <div>
+      <div style={{ display: "flex", gap: 14, marginBottom: 12 }}>
+        <Legend color={colorA} label={legendA} />
+        <Legend color={colorB} label={legendB} />
+      </div>
+      <div style={{ display: "flex", alignItems: "flex-end", gap: 10, height: 130, overflowX: "auto", paddingBottom: 4 }}>
+        {labels.map((lab, i) => (
+          <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", minWidth: 34 }}>
+            <div style={{ display: "flex", alignItems: "flex-end", gap: 3, height: 110 }}>
+              <div style={{ width: 11, height: `${(seriesA[i] / max) * 100}%`, background: colorA, borderRadius: "3px 3px 0 0" }} />
+              <div style={{ width: 11, height: `${(seriesB[i] / max) * 100}%`, background: colorB, borderRadius: "3px 3px 0 0" }} />
+            </div>
+            <span style={{ fontSize: 9.5, color: "#8A8270", marginTop: 5, ...styles.mono }}>{lab}</span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Mini graphique en ligne (une série, valeurs pouvant être nulles)
+function MiniLine({ labels, values, color }) {
+  const valid = values.filter((v) => v != null);
+  const min = Math.min(...valid);
+  const max = Math.max(...valid);
+  const range = max - min || 1;
+  const h = 110;
+  const w = Math.max(labels.length * 44, 44);
+  const pts = values
+    .map((v, i) => {
+      if (v == null) return null;
+      const x = (i / Math.max(labels.length - 1, 1)) * (w - 20) + 10;
+      const y = h - ((v - min) / range) * (h - 20) - 10;
+      return `${x},${y}`;
+    })
+    .filter(Boolean)
+    .join(" ");
+
+  return (
+    <div style={{ overflowX: "auto" }}>
+      <svg width={w} height={h + 22} style={{ display: "block" }}>
+        <polyline points={pts} fill="none" stroke={color} strokeWidth="2.5" strokeLinejoin="round" strokeLinecap="round" />
+        {values.map((v, i) => {
+          if (v == null) return null;
+          const x = (i / Math.max(labels.length - 1, 1)) * (w - 20) + 10;
+          const y = h - ((v - min) / range) * (h - 20) - 10;
+          return <circle key={i} cx={x} cy={y} r="3.5" fill={color} />;
+        })}
+        {labels.map((lab, i) => {
+          const x = (i / Math.max(labels.length - 1, 1)) * (w - 20) + 10;
+          return (
+            <text key={i} x={x} y={h + 14} fontSize="9.5" fill="#8A8270" textAnchor="middle" fontFamily="'JetBrains Mono', monospace">
+              {lab}
+            </text>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function Legend({ color, label }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
+      <div style={{ width: 10, height: 10, borderRadius: 3, background: color }} />
+      <span style={{ fontSize: 11.5, color: "#6B6356" }}>{label}</span>
+    </div>
+  );
+}
+
 // ---------- COACH AGENT ----------
 function CoachAgent({ profile, meals, workouts, bio, totalIntake, totalBurn }) {
   const [advice, setAdvice] = useState(null);
   const [loading, setLoading] = useState(false);
 
-  // BMR via Mifflin-St Jeor, ajusté par sommeil/pas
-  const sexFactor = profile.sexe === "Homme" ? 5 : profile.sexe === "Femme" ? -161 : -78;
-  const baseBMR = Math.round(10 * (profile.poids || 70) + 6.25 * (profile.taille || 170) - 5 * (profile.age || 30) + sexFactor);
-  const stepsBurn = Math.round(bio.steps * 0.04);
-  const sleepFactor = bio.sleepHours < 6.5 ? 0.96 : 1;
-  const totalExpenditure = Math.round((baseBMR + stepsBurn + totalBurn) * sleepFactor);
+  // Dépense via la fonction partagée (cohérence avec l'historique)
+  const totalExpenditure = computeExpenditure(profile, bio, totalBurn);
   const balance = totalIntake - totalExpenditure;
   const targetBalance = profile.targetSurplus ?? 0;
   const gap = targetBalance - balance;
