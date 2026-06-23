@@ -779,7 +779,7 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
       <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
         <SectionLabelDark>Agent Nutrition</SectionLabelDark>
         <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 14px", lineHeight: 1.3 }}>
-          Photo, voix ou saisie — choisis ce qui va le plus vite.
+          Enregistre ton repas comme tu veux.
         </p>
 
         <ModeSelector mode={mode} setMode={setMode} modes={NUTRITION_MODES} />
@@ -1339,7 +1339,7 @@ Refais l'estimation en tenant compte de cette correction (prioritaire). Réponds
       <Card style={{ background: "#15201C", color: "#F6F3EC", border: "none" }}>
         <SectionLabelDark>Agent Entraînement</SectionLabelDark>
         <p style={{ ...styles.display, fontSize: 19, margin: "2px 0 14px", lineHeight: 1.3 }}>
-          Raconte ta séance, parle-la, prends-la en photo, ou saisis-la.
+          Enregistre ta séance comme tu veux.
         </p>
 
         <ModeSelector mode={mode} setMode={setMode} modes={TRAINING_MODES} />
