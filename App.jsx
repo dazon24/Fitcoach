@@ -124,6 +124,7 @@ function useSpeechToText() {
   const [transcript, setTranscript] = useState("");
   const [unsupported, setUnsupported] = useState(false);
   const recRef = useRef(null);
+  const finalRef = useRef("");
 
   function start() {
     const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
@@ -136,13 +137,22 @@ function useSpeechToText() {
     rec.interimResults = true;
     rec.continuous = true;
     rec.onresult = (e) => {
-      let text = "";
-      for (let i = 0; i < e.results.length; i++) text += e.results[i][0].transcript;
-      setTranscript(text);
+      let interim = "";
+      // On ne traite que les nouveaux résultats à partir de e.resultIndex
+      for (let i = e.resultIndex; i < e.results.length; i++) {
+        const res = e.results[i];
+        if (res.isFinal) {
+          finalRef.current += res[0].transcript + " ";
+        } else {
+          interim += res[0].transcript;
+        }
+      }
+      setTranscript((finalRef.current + interim).trim());
     };
     rec.onend = () => setListening(false);
     rec.onerror = () => setListening(false);
     recRef.current = rec;
+    finalRef.current = "";
     setTranscript("");
     setListening(true);
     rec.start();
@@ -153,7 +163,12 @@ function useSpeechToText() {
     setListening(false);
   }
 
-  return { listening, transcript, start, stop, unsupported, setTranscript };
+  function reset() {
+    finalRef.current = "";
+    setTranscript("");
+  }
+
+  return { listening, transcript, start, stop, unsupported, setTranscript, reset };
 }
 
 // ---------- input mode selector ----------
@@ -288,6 +303,7 @@ export default function App() {
 // ---------- profile setup (onboarding multi-testeurs) ----------
 const GOALS = ["Prise de masse", "Perte de poids", "Maintien", "Performance"];
 const SEXES = ["Femme", "Homme", "Autre"];
+const SPORTS = ["Course à pied", "Trail", "Musculation", "CrossFit", "Vélo", "Natation", "HIIT", "Yoga", "Football", "Rugby", "Tennis", "Escalade", "Autre"];
 
 function ProfileSetup({ existing, onSave }) {
   useInjectFonts();
@@ -300,9 +316,17 @@ function ProfileSetup({ existing, onSave }) {
       taille: "",
       poids: "",
       goal: GOALS[0],
+      sports: [],
       targetSurplus: 400,
     }
   );
+
+  function toggleSport(s) {
+    setForm((f) => {
+      const cur = f.sports || [];
+      return { ...f, sports: cur.includes(s) ? cur.filter((x) => x !== s) : [...cur, s] };
+    });
+  }
 
   const canSave = form.prenom.trim() && form.age && form.poids;
 
@@ -384,6 +408,33 @@ function ProfileSetup({ existing, onSave }) {
               </option>
             ))}
           </select>
+        </div>
+
+        <div style={{ marginBottom: 18 }}>
+          <label style={labelStyle}>Sports pratiqués (un ou plusieurs)</label>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 7, marginTop: 4 }}>
+            {SPORTS.map((s) => {
+              const active = (form.sports || []).includes(s);
+              return (
+                <button
+                  key={s}
+                  onClick={() => toggleSport(s)}
+                  style={{
+                    padding: "7px 12px",
+                    borderRadius: 20,
+                    border: "1px solid",
+                    borderColor: active ? "#3F5C49" : "#D8D2C2",
+                    background: active ? "#3F5C49" : "transparent",
+                    color: active ? "#F6F3EC" : "#6B6356",
+                    fontSize: 12.5,
+                    cursor: "pointer",
+                  }}
+                >
+                  {s}
+                </button>
+              );
+            })}
+          </div>
         </div>
 
         <button
@@ -545,8 +596,12 @@ function NutritionAgent({ meals, setMeals }) {
   const [mode, setMode] = useState("photo");
   const [analyzing, setAnalyzing] = useState(false);
   const [pendingImage, setPendingImage] = useState(null);
+  const [pendingBase64, setPendingBase64] = useState(null);
+  const [pendingMime, setPendingMime] = useState(null);
   const [draft, setDraft] = useState(null);
   const [error, setError] = useState(null);
+  const [showCorrection, setShowCorrection] = useState(false);
+  const [correctionNote, setCorrectionNote] = useState("");
   const inputRef = useRef(null);
 
   // audio
@@ -566,10 +621,14 @@ function NutritionAgent({ meals, setMeals }) {
     if (!file) return;
     setError(null);
     setDraft(null);
+    setShowCorrection(false);
+    setCorrectionNote("");
     setAnalyzing(true);
     try {
       const base64 = await fileToBase64(file);
       setPendingImage(`data:${file.type};base64,${base64}`);
+      setPendingBase64(base64);
+      setPendingMime(file.type);
 
       const prompt = `Tu es un agent de reconnaissance alimentaire. Analyse cette photo de repas et réponds UNIQUEMENT en JSON, sans aucun texte autour, avec ce format exact:
 {
@@ -594,6 +653,45 @@ Sois réaliste sur les portions à partir de repères visuels (taille d'assiette
       setDraft(parsed);
     } catch (err) {
       setError("L'analyse a échoué. Réessaie avec une autre photo, ou utilise le mode audio ou manuel.");
+    } finally {
+      setAnalyzing(false);
+    }
+  }
+
+  // Réanalyse de la photo en tenant compte de la correction de l'utilisateur
+  async function reanalyzeWithCorrection() {
+    if (!pendingBase64 || !correctionNote.trim()) return;
+    setError(null);
+    setAnalyzing(true);
+    setShowCorrection(false);
+    try {
+      const prompt = `Tu es un agent de reconnaissance alimentaire. Tu avais proposé cette analyse de la photo:
+${JSON.stringify(draft)}
+
+L'utilisateur indique que c'est en partie faux et précise: "${correctionNote}"
+
+Refais l'analyse en tenant compte de cette correction (elle est prioritaire sur ce que tu crois voir). Réponds UNIQUEMENT en JSON, même format:
+{
+  "items": [{"name": "string", "portion_estimee": "string", "kcal": number, "proteines_g": number, "glucides_g": number, "lipides_g": number}],
+  "kcal_total": number,
+  "confiance": "haute" | "moyenne" | "basse",
+  "question_pour_utilisateur": null
+}`;
+      const text = await callClaude([
+        {
+          role: "user",
+          content: [
+            { type: "image", source: { type: "base64", media_type: pendingMime, data: pendingBase64 } },
+            { type: "text", text: prompt },
+          ],
+        },
+      ]);
+      const parsed = parseJsonLoose(text);
+      if (!parsed) throw new Error("parse_failed");
+      setDraft(parsed);
+      setCorrectionNote("");
+    } catch {
+      setError("La réanalyse a échoué. Tu peux confirmer l'estimation actuelle ou réessayer.");
     } finally {
       setAnalyzing(false);
     }
@@ -680,7 +778,7 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
 
         {mode === "photo" && (
           <>
-            <input ref={inputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} id="meal-upload" />
+            <input ref={inputRef} type="file" accept="image/*" onChange={handleFile} style={{ display: "none" }} id="meal-upload" />
             <label
               htmlFor="meal-upload"
               style={{
@@ -711,7 +809,7 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
         )}
 
         {mode === "manuel" && (
-          <ManualMealForm manual={manual} setManual={setManual} onSubmit={addManualMeal} />
+          <ManualMealForm manual={manual} setManual={setManual} onSubmit={addManualMeal} onAnalyzeText={analyzeAudioTranscript} />
         )}
       </Card>
 
@@ -775,6 +873,65 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
               >
                 Confirmer ce repas
               </button>
+
+              {pendingBase64 && !showCorrection && (
+                <button
+                  onClick={() => setShowCorrection(true)}
+                  style={{
+                    marginTop: 9,
+                    width: "100%",
+                    background: "transparent",
+                    color: "#C76B3E",
+                    border: "1px solid #E0CFC9",
+                    borderRadius: 9,
+                    padding: "10px 0",
+                    fontWeight: 500,
+                    fontSize: 13,
+                    cursor: "pointer",
+                  }}
+                >
+                  L'analyse est fausse ? Corriger
+                </button>
+              )}
+
+              {showCorrection && (
+                <div style={{ marginTop: 12, background: "#F6F3EC", padding: 12, borderRadius: 10 }}>
+                  <div style={{ fontSize: 12.5, color: "#6B6356", marginBottom: 8, lineHeight: 1.45 }}>
+                    Explique ce qui est faux (l'aliment, la quantité…). L'agent réanalysera la photo en tenant compte de ta correction.
+                  </div>
+                  <textarea
+                    value={correctionNote}
+                    onChange={(e) => setCorrectionNote(e.target.value)}
+                    placeholder="Ex: ce n'est pas du riz mais du quinoa, et il y a environ 200g de poulet"
+                    rows={3}
+                    style={{
+                      width: "100%",
+                      border: "1px solid #D8D2C2",
+                      borderRadius: 9,
+                      padding: 10,
+                      fontSize: 13.5,
+                      fontFamily: "inherit",
+                      resize: "none",
+                      boxSizing: "border-box",
+                    }}
+                  />
+                  <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                    <button
+                      onClick={() => { setShowCorrection(false); setCorrectionNote(""); }}
+                      style={{ flex: 1, background: "transparent", color: "#6B6356", border: "1px solid #D8D2C2", borderRadius: 8, padding: "9px 0", fontSize: 13, cursor: "pointer" }}
+                    >
+                      Annuler
+                    </button>
+                    <button
+                      onClick={reanalyzeWithCorrection}
+                      disabled={!correctionNote.trim()}
+                      style={{ flex: 1, background: "#3F5C49", color: "#F6F3EC", border: "none", borderRadius: 8, padding: "9px 0", fontSize: 13, fontWeight: 600, cursor: correctionNote.trim() ? "pointer" : "default", opacity: correctionNote.trim() ? 1 : 0.5 }}
+                    >
+                      Réanalyser
+                    </button>
+                  </div>
+                </div>
+              )}
             </>
           )}
         </Card>
@@ -879,7 +1036,10 @@ function AudioCapture({ speech, onSubmit, placeholder }) {
 }
 
 // ---------- nutrition: manual form ----------
-function ManualMealForm({ manual, setManual, onSubmit }) {
+function ManualMealForm({ manual, setManual, onSubmit, onAnalyzeText }) {
+  const [sub, setSub] = useState("decrire"); // "decrire" = IA calcule, "chiffres" = saisie directe
+  const [desc, setDesc] = useState("");
+
   const inputStyle = {
     width: "100%",
     background: "#1F2A24",
@@ -892,38 +1052,69 @@ function ManualMealForm({ manual, setManual, onSubmit }) {
     boxSizing: "border-box",
     marginBottom: 8,
   };
+
   return (
     <div>
-      <input
-        placeholder="Nom du repas (ex: poulet riz brocolis)"
-        value={manual.name}
-        onChange={(e) => setManual((m) => ({ ...m, name: e.target.value }))}
-        style={inputStyle}
-      />
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
-        <input placeholder="Kcal" type="number" value={manual.kcal} onChange={(e) => setManual((m) => ({ ...m, kcal: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
-        <input placeholder="Protéines (g)" type="number" value={manual.proteines} onChange={(e) => setManual((m) => ({ ...m, proteines: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+      {/* Sélecteur de sous-mode */}
+      <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+        <button
+          onClick={() => setSub("decrire")}
+          style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: "1px solid", borderColor: sub === "decrire" ? "transparent" : "#3A453E", background: sub === "decrire" ? "#E8E1D2" : "transparent", color: sub === "decrire" ? "#15201C" : "#A8A493", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
+        >
+          Décrire (calcul auto)
+        </button>
+        <button
+          onClick={() => setSub("chiffres")}
+          style={{ flex: 1, padding: "8px 0", borderRadius: 8, border: "1px solid", borderColor: sub === "chiffres" ? "transparent" : "#3A453E", background: sub === "chiffres" ? "#E8E1D2" : "transparent", color: sub === "chiffres" ? "#15201C" : "#A8A493", fontSize: 12.5, fontWeight: 500, cursor: "pointer" }}
+        >
+          Saisir les chiffres
+        </button>
       </div>
-      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
-        <input placeholder="Glucides (g)" type="number" value={manual.glucides} onChange={(e) => setManual((m) => ({ ...m, glucides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
-        <input placeholder="Lipides (g)" type="number" value={manual.lipides} onChange={(e) => setManual((m) => ({ ...m, lipides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
-      </div>
-      <button
-        onClick={onSubmit}
-        style={{
-          width: "100%",
-          background: "#E8E1D2",
-          color: "#15201C",
-          border: "none",
-          borderRadius: 9,
-          padding: "11px 0",
-          fontWeight: 600,
-          fontSize: 14,
-          cursor: "pointer",
-        }}
-      >
-        Ajouter le repas
-      </button>
+
+      {sub === "decrire" ? (
+        <>
+          <div style={{ fontSize: 12, color: "#A8A493", marginBottom: 8, lineHeight: 1.45 }}>
+            Liste ce que tu as mangé avec les quantités. L'agent calcule les calories et macros pour toi.
+          </div>
+          <textarea
+            value={desc}
+            onChange={(e) => setDesc(e.target.value)}
+            placeholder="Ex: 200g de riz basmati, 150g de blanc de poulet, une cuillère d'huile d'olive"
+            rows={4}
+            style={{ ...inputStyle, resize: "none" }}
+          />
+          <button
+            onClick={() => { if (desc.trim()) { onAnalyzeText(desc); setDesc(""); } }}
+            disabled={!desc.trim()}
+            style={{ width: "100%", background: "#E8E1D2", color: "#15201C", border: "none", borderRadius: 9, padding: "11px 0", fontWeight: 600, fontSize: 14, cursor: desc.trim() ? "pointer" : "default", opacity: desc.trim() ? 1 : 0.5 }}
+          >
+            Calculer les nutriments
+          </button>
+        </>
+      ) : (
+        <>
+          <input
+            placeholder="Nom du repas (ex: poulet riz brocolis)"
+            value={manual.name}
+            onChange={(e) => setManual((m) => ({ ...m, name: e.target.value }))}
+            style={inputStyle}
+          />
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 8 }}>
+            <input placeholder="Kcal" type="number" value={manual.kcal} onChange={(e) => setManual((m) => ({ ...m, kcal: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+            <input placeholder="Protéines (g)" type="number" value={manual.proteines} onChange={(e) => setManual((m) => ({ ...m, proteines: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+          </div>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8, marginBottom: 10 }}>
+            <input placeholder="Glucides (g)" type="number" value={manual.glucides} onChange={(e) => setManual((m) => ({ ...m, glucides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+            <input placeholder="Lipides (g)" type="number" value={manual.lipides} onChange={(e) => setManual((m) => ({ ...m, lipides: e.target.value }))} style={{ ...inputStyle, marginBottom: 0 }} />
+          </div>
+          <button
+            onClick={onSubmit}
+            style={{ width: "100%", background: "#E8E1D2", color: "#15201C", border: "none", borderRadius: 9, padding: "11px 0", fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+          >
+            Ajouter le repas
+          </button>
+        </>
+      )}
     </div>
   );
 }
@@ -1140,7 +1331,7 @@ Si la machine affiche directement des calories, utilise cette valeur en priorit�
 
         {mode === "photo" && (
           <>
-            <input ref={photoInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display: "none" }} id="workout-photo" />
+            <input ref={photoInputRef} type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} id="workout-photo" />
             <label
               htmlFor="workout-photo"
               style={{
@@ -1533,17 +1724,20 @@ function CoachAgent({ profile, meals, workouts, bio, totalIntake, totalBurn }) {
   async function askCoach() {
     setLoading(true);
     try {
-      const prompt = `Tu es un coach sportif et nutrition. Voici les données du jour pour ${profile.prenom}, ${profile.age} ans, objectif: ${profile.goal}.
+      const sportsTxt = (profile.sports && profile.sports.length) ? profile.sports.join(", ") : "non précisé";
+      const prompt = `Tu es un coach sportif et nutrition expérimenté. Voici les données du jour pour ${profile.prenom}, ${profile.age} ans, objectif: ${profile.goal}.
+Sports pratiqués: ${sportsTxt}.
 Dépense énergétique totale estimée: ${totalExpenditure} kcal (métabolisme de base + pas + sport).
 Apport alimentaire: ${totalIntake} kcal sur ${meals.length} repas.
 Séances: ${workouts.map((w) => `${w.type} (${w.duree_min}min, ${w.kcal_estime}kcal)`).join(", ") || "aucune"}.
 Biométrie: FC repos ${bio.restingHR}bpm, VFC ${bio.hrv}ms, sommeil ${bio.sleepHours}h, pas ${bio.steps}, poids ${bio.weight}kg.
 Objectif calorique pour l'objectif "${profile.goal}": un delta d'environ ${targetBalance >= 0 ? "+" : ""}${targetBalance} kcal/jour par rapport à la dépense.
 
-Donne un message de coach direct, chaleureux mais factuel, en 3-4 phrases maximum, en français, qui:
-1. Résume où en est la personne par rapport à son objectif
-2. Donne une recommandation concrète et actionnable pour la fin de journée
-Ne donne pas de liste, écris en prose, ton de coach personnel. Adresse-toi à ${profile.prenom} directement.`;
+Donne un message de coach direct, chaleureux mais factuel, en 4-5 phrases maximum, en français, qui:
+1. Résume où en est la personne par rapport à son objectif calorique du jour.
+2. Donne une recommandation nutrition concrète pour la fin de journée.
+3. Donne un conseil d'entraînement adapté à ses sports (${sportsTxt}) ET à son objectif. Important: quel que soit l'objectif, intègre la musculation/renforcement dans tes conseils — pour la perte de graisse (préserver la masse musculaire et augmenter la dépense au repos) comme pour la prise de masse (stimulus d'hypertrophie). Si l'objectif est la performance, oriente selon les sports pratiqués.
+Ne donne pas de liste à puces, écris en prose fluide, ton de coach personnel. Adresse-toi à ${profile.prenom} directement.`;
       const text = await callClaude([{ role: "user", content: prompt }]);
       setAdvice(text.trim());
     } catch {
