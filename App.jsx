@@ -969,7 +969,7 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
 }
 
 // ---------- shared: audio capture ----------
-function AudioCapture({ speech, onSubmit, placeholder }) {
+function AudioCapture({ speech, onSubmit, placeholder, label = "Parler de ton repas" }) {
   if (speech.unsupported) {
     return (
       <div style={{ fontSize: 13, color: "#A8A493", lineHeight: 1.5 }}>
@@ -999,7 +999,7 @@ function AudioCapture({ speech, onSubmit, placeholder }) {
         }}
       >
         {speech.listening ? <Square size={15} /> : <Mic size={17} />}
-        {speech.listening ? "Arrêter l'enregistrement" : "Parler de ton repas"}
+        {speech.listening ? "Arrêter l'enregistrement" : label}
       </button>
 
       <div
@@ -1390,6 +1390,7 @@ Refais l'estimation en tenant compte de cette correction (prioritaire). Réponds
           <AudioCapture
             speech={speech}
             onSubmit={analyzeText}
+            label="Parler de ta séance"
             placeholder="Ex: « j'ai fait 45 minutes de course, allure modérée, un peu de dénivelé »"
           />
         )}
