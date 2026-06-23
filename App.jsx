@@ -435,6 +435,14 @@ function ProfileSetup({ existing, onSave }) {
               );
             })}
           </div>
+          {(form.sports || []).includes("Autre") && (
+            <input
+              value={form.autreSport || ""}
+              onChange={(e) => update("autreSport", e.target.value)}
+              placeholder="Précise ton/tes autre(s) sport(s)"
+              style={{ ...inputStyle, marginTop: 10 }}
+            />
+          )}
         </div>
 
         <button
@@ -778,25 +786,22 @@ Estime les portions de façon réaliste même si elles ne sont pas précisées (
 
         {mode === "photo" && (
           <>
-            <input ref={inputRef} type="file" accept="image/*" onChange={handleFile} style={{ display: "none" }} id="meal-upload" />
-            <label
-              htmlFor="meal-upload"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 8,
-                background: "#E8E1D2",
-                color: "#15201C",
-                borderRadius: 10,
-                padding: "12px 0",
-                fontWeight: 600,
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              <Camera size={17} /> Ajouter un repas
-            </label>
+            <input ref={inputRef} type="file" accept="image/*" capture="environment" onChange={handleFile} style={{ display: "none" }} id="meal-camera" />
+            <input type="file" accept="image/*" onChange={handleFile} style={{ display: "none" }} id="meal-gallery" />
+            <div style={{ display: "flex", gap: 8 }}>
+              <label
+                htmlFor="meal-camera"
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, background: "#E8E1D2", color: "#15201C", borderRadius: 10, padding: "12px 0", fontWeight: 600, fontSize: 13.5, cursor: "pointer" }}
+              >
+                <Camera size={16} /> Photo
+              </label>
+              <label
+                htmlFor="meal-gallery"
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, background: "transparent", color: "#E8E1D2", border: "1px solid #3A453E", borderRadius: 10, padding: "12px 0", fontWeight: 600, fontSize: 13.5, cursor: "pointer" }}
+              >
+                <ImageIcon size={16} /> Galerie
+              </label>
+            </div>
           </>
         )}
 
@@ -1170,6 +1175,11 @@ function TrainingAgent({ workouts, setWorkouts }) {
   const speech = useSpeechToText();
   const photoInputRef = useRef(null);
   const [pendingImage, setPendingImage] = useState(null);
+  const [pendingBase64, setPendingBase64] = useState(null);
+  const [pendingMime, setPendingMime] = useState(null);
+  const [draft, setDraft] = useState(null);
+  const [showCorrection, setShowCorrection] = useState(false);
+  const [correctionNote, setCorrectionNote] = useState("");
 
   const [manual, setManual] = useState({ type: ACTIVITIES[0], duree: "", intensite: "modérée", kcal: "" });
 
@@ -1184,6 +1194,8 @@ function TrainingAgent({ workouts, setWorkouts }) {
     if (!description.trim()) return;
     setAnalyzing(true);
     setError(null);
+    setShowCorrection(false);
+    setCorrectionNote("");
     try {
       const prompt = `Tu es un agent d'estimation de dépense énergétique à l'entraînement. À partir de cette description en langage libre d'une séance, réponds UNIQUEMENT en JSON:
 {
@@ -1198,7 +1210,9 @@ Base-toi sur une personne de profil moyen actif (~70kg) si aucune donnée n'est 
       const out = await callClaude([{ role: "user", content: prompt }]);
       const parsed = parseJsonLoose(out);
       if (!parsed) throw new Error("parse_failed");
-      setWorkouts((prev) => [...prev, { id: Date.now(), ...parsed }]);
+      setDraft(parsed);
+      setPendingImage(null);
+      setPendingBase64(null);
       setText("");
       speech.setTranscript("");
     } catch {
@@ -1212,10 +1226,14 @@ Base-toi sur une personne de profil moyen actif (~70kg) si aucune donnée n'est 
     const file = e.target.files?.[0];
     if (!file) return;
     setError(null);
+    setShowCorrection(false);
+    setCorrectionNote("");
     setAnalyzing(true);
     try {
       const base64 = await fileToBase64(file);
       setPendingImage(`data:${file.type};base64,${base64}`);
+      setPendingBase64(base64);
+      setPendingMime(file.type);
 
       const prompt = `Tu es un agent d'estimation de dépense énergétique à l'entraînement. L'image montre soit un tableau de séance écrit (ex: salle de CrossFit/musculation), soit l'écran d'une machine de cardio (rameur, vélo, tapis, etc). Lis les informations visibles (type d'effort, durée, distance, calories affichées, séries, répétitions, watts...) et réponds UNIQUEMENT en JSON:
 {
@@ -1241,14 +1259,61 @@ Si la machine affiche directement des calories, utilise cette valeur en priorit�
       if (!parsed.kcal_estime) {
         setError(parsed.resume || "Impossible de lire les données sur cette image. Essaie une photo plus nette ou un autre mode.");
       } else {
-        setWorkouts((prev) => [...prev, { id: Date.now(), ...parsed }]);
-        setPendingImage(null);
+        setDraft(parsed);
       }
     } catch {
       setError("L'analyse de l'image a échoué. Réessaie ou utilise un autre mode.");
     } finally {
       setAnalyzing(false);
       if (photoInputRef.current) photoInputRef.current.value = "";
+    }
+  }
+
+  // Confirme le brouillon : ajoute la séance à la liste
+  function confirmWorkout() {
+    if (!draft) return;
+    setWorkouts((prev) => [...prev, { id: Date.now(), ...draft }]);
+    setDraft(null);
+    setPendingImage(null);
+    setPendingBase64(null);
+  }
+
+  // Réanalyse en tenant compte de la correction de l'utilisateur
+  async function reanalyzeWorkout() {
+    if (!correctionNote.trim() || !draft) return;
+    setError(null);
+    setAnalyzing(true);
+    setShowCorrection(false);
+    try {
+      const content = [];
+      if (pendingBase64) {
+        content.push({ type: "image", source: { type: "base64", media_type: pendingMime, data: pendingBase64 } });
+      }
+      content.push({
+        type: "text",
+        text: `Tu es un agent d'estimation de dépense à l'entraînement. Tu avais proposé:
+${JSON.stringify(draft)}
+
+L'utilisateur corrige: "${correctionNote}"
+
+Refais l'estimation en tenant compte de cette correction (prioritaire). Réponds UNIQUEMENT en JSON, même format:
+{
+  "type": "string",
+  "duree_min": number,
+  "intensite": "faible" | "modérée" | "élevée",
+  "kcal_estime": number,
+  "resume": "string"
+}`,
+      });
+      const out = await callClaude([{ role: "user", content }]);
+      const parsed = parseJsonLoose(out);
+      if (!parsed) throw new Error("parse_failed");
+      setDraft(parsed);
+      setCorrectionNote("");
+    } catch {
+      setError("La réanalyse a échoué. Tu peux confirmer l'estimation actuelle ou réessayer.");
+    } finally {
+      setAnalyzing(false);
     }
   }
 
@@ -1331,25 +1396,22 @@ Si la machine affiche directement des calories, utilise cette valeur en priorit�
 
         {mode === "photo" && (
           <>
-            <input ref={photoInputRef} type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} id="workout-photo" />
-            <label
-              htmlFor="workout-photo"
-              style={{
-                display: "flex",
-                alignItems: "center",
-                justifyContent: "center",
-                gap: 8,
-                background: "#E8E1D2",
-                color: "#15201C",
-                borderRadius: 10,
-                padding: "12px 0",
-                fontWeight: 600,
-                fontSize: 14,
-                cursor: "pointer",
-              }}
-            >
-              <Camera size={17} /> Photographier un tableau ou un écran
-            </label>
+            <input ref={photoInputRef} type="file" accept="image/*" capture="environment" onChange={handlePhoto} style={{ display: "none" }} id="workout-camera" />
+            <input type="file" accept="image/*" onChange={handlePhoto} style={{ display: "none" }} id="workout-gallery" />
+            <div style={{ display: "flex", gap: 8 }}>
+              <label
+                htmlFor="workout-camera"
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, background: "#E8E1D2", color: "#15201C", borderRadius: 10, padding: "12px 0", fontWeight: 600, fontSize: 13.5, cursor: "pointer" }}
+              >
+                <Camera size={16} /> Photo
+              </label>
+              <label
+                htmlFor="workout-gallery"
+                style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center", gap: 7, background: "transparent", color: "#E8E1D2", border: "1px solid #3A453E", borderRadius: 10, padding: "12px 0", fontWeight: 600, fontSize: 13.5, cursor: "pointer" }}
+              >
+                <ImageIcon size={16} /> Galerie
+              </label>
+            </div>
             <p style={{ fontSize: 11.5, color: "#A8A493", marginTop: 8, marginBottom: 0, lineHeight: 1.4 }}>
               Tableau de séance affiché en salle, écran de rameur, vélo ou tapis.
             </p>
@@ -1378,6 +1440,71 @@ Si la machine affiche directement des calories, utilise cette valeur en priorit�
       {error && (
         <Card style={{ borderColor: "#C76B3E" }}>
           <div style={{ color: "#C76B3E", fontSize: 14 }}>{error}</div>
+        </Card>
+      )}
+
+      {draft && !analyzing && (
+        <Card>
+          <SectionLabel>Résultat de l'analyse</SectionLabel>
+          {pendingImage && (
+            <img src={pendingImage} alt="séance" style={{ width: "100%", height: 150, objectFit: "cover", borderRadius: 10, marginBottom: 12 }} />
+          )}
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "baseline" }}>
+            <span style={{ fontSize: 15, fontWeight: 600 }}>{draft.type}</span>
+            <span style={{ ...styles.mono, fontSize: 16, fontWeight: 600 }}>{draft.kcal_estime} kcal</span>
+          </div>
+          <div style={{ fontSize: 12.5, color: "#8A8270", marginTop: 3 }}>
+            {draft.duree_min} min · intensité {draft.intensite}
+          </div>
+          {draft.resume && (
+            <div style={{ marginTop: 8, fontSize: 12.5, color: "#6B6356", lineHeight: 1.4 }}>{draft.resume}</div>
+          )}
+
+          <button
+            onClick={confirmWorkout}
+            style={{ marginTop: 14, width: "100%", background: "#3F5C49", color: "#F6F3EC", border: "none", borderRadius: 9, padding: "11px 0", fontWeight: 600, fontSize: 14, cursor: "pointer" }}
+          >
+            Confirmer la séance
+          </button>
+
+          {!showCorrection && (
+            <button
+              onClick={() => setShowCorrection(true)}
+              style={{ marginTop: 9, width: "100%", background: "transparent", color: "#C76B3E", border: "1px solid #E0CFC9", borderRadius: 9, padding: "10px 0", fontWeight: 500, fontSize: 13, cursor: "pointer" }}
+            >
+              L'analyse est fausse ? Corriger
+            </button>
+          )}
+
+          {showCorrection && (
+            <div style={{ marginTop: 12, background: "#F6F3EC", padding: 12, borderRadius: 10 }}>
+              <div style={{ fontSize: 12.5, color: "#6B6356", marginBottom: 8, lineHeight: 1.45 }}>
+                Explique ce qui est faux (durée, intensité, type…). L'agent réestimera en tenant compte de ta correction.
+              </div>
+              <textarea
+                value={correctionNote}
+                onChange={(e) => setCorrectionNote(e.target.value)}
+                placeholder="Ex: c'était plutôt 1h, et l'intensité était élevée"
+                rows={3}
+                style={{ width: "100%", border: "1px solid #D8D2C2", borderRadius: 9, padding: 10, fontSize: 13.5, fontFamily: "inherit", resize: "none", boxSizing: "border-box" }}
+              />
+              <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+                <button
+                  onClick={() => { setShowCorrection(false); setCorrectionNote(""); }}
+                  style={{ flex: 1, background: "transparent", color: "#6B6356", border: "1px solid #D8D2C2", borderRadius: 8, padding: "9px 0", fontSize: 13, cursor: "pointer" }}
+                >
+                  Annuler
+                </button>
+                <button
+                  onClick={reanalyzeWorkout}
+                  disabled={!correctionNote.trim()}
+                  style={{ flex: 1, background: "#3F5C49", color: "#F6F3EC", border: "none", borderRadius: 8, padding: "9px 0", fontSize: 13, fontWeight: 600, cursor: correctionNote.trim() ? "pointer" : "default", opacity: correctionNote.trim() ? 1 : 0.5 }}
+                >
+                  Réanalyser
+                </button>
+              </div>
+            </div>
+          )}
         </Card>
       )}
 
@@ -1724,7 +1851,8 @@ function CoachAgent({ profile, meals, workouts, bio, totalIntake, totalBurn }) {
   async function askCoach() {
     setLoading(true);
     try {
-      const sportsTxt = (profile.sports && profile.sports.length) ? profile.sports.join(", ") : "non précisé";
+      const sportsList = (profile.sports || []).map((s) => (s === "Autre" && profile.autreSport ? profile.autreSport : s));
+      const sportsTxt = sportsList.length ? sportsList.join(", ") : "non précisé";
       const prompt = `Tu es un coach sportif et nutrition expérimenté. Voici les données du jour pour ${profile.prenom}, ${profile.age} ans, objectif: ${profile.goal}.
 Sports pratiqués: ${sportsTxt}.
 Dépense énergétique totale estimée: ${totalExpenditure} kcal (métabolisme de base + pas + sport).
